@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# sheetelligence — prompt-native manifest generation for Sheeternetes.
+# Turns a plain-English intent into a Sheeternetes deployment manifest (JSON).
+#
+# Two engines:
+#   * LLM (if ANTHROPIC_API_KEY is set) — asks a small Claude model for the manifest.
+#   * Rule-based fallback (always available) — parses image, replicas and name
+#     from the intent with keyword rules. Always emits valid JSON.
+#
+# The emitted manifest carries both the documented resource keys (cpu, memory)
+# and the apiserver's field names (cpu_req, mem_req), so it prints per the
+# Sheeternetes shape AND applies cleanly via skctl / the Apps Script apiserver.
+#
+# Requires: bash, jq. (curl only for --apply and the LLM engine.)
+#
+# Config via env or a .skctl.env file (next to this script or in the cwd):
+#   WEBAPP_URL=https://script.google.com/macros/s/XXXX/exec
+#   TOKEN=CHANGE_ME_super_secret
+#   ANTHROPIC_API_KEY=sk-ant-...      # optional, enables the LLM engine
+#   ANTHROPIC_MODEL=claude-haiku-4-5  # optional, override the model
+#
+# Usage:
+#   sheetelligence "run 3 replicas of nginx called web"     # print manifest
+#   sheetelligence --apply "scale redis cache to 5"         # print + POST it
+#   sheetelligence "..." | skctl apply /dev/stdin           # pipe into skctl
+#
+set -eu
+
+here="$(cd "$(dirname "$0")" && pwd)"
+
+# ---- config -----------------------------------------------------------------
+for envf in "$here/.skctl.env" "./.skctl.env"; do
+  # shellcheck disable=SC1090
+  [ -f "$envf" ] && . "$envf"
+done
+MODEL="${ANTHROPIC_MODEL:-claude-haiku-4-5}"
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
+
+command -v jq >/dev/null 2>&1 || { echo "sheetelligence: jq is required" >&2; exit 1; }
+
+# ---- rule-based fallback ----------------------------------------------------
+extract_replicas() {
+  local s="$1" n=""
+  n=$(printf '%s' "$s" | grep -oiE 'scale( [a-z]+){0,3} to [0-9]+' | grep -oE '[0-9]+' | tail -1 | head -1)
+  [ -n "$n" ] && { echo "$n"; return; }
+  n=$(printf '%s' "$s" | grep -oiE '[0-9]+ *(replicas?|instances?|copies|copy|pods?|nodes?)' | grep -oE '[0-9]+' | head -1)
+  [ -n "$n" ] && { echo "$n"; return; }
+  n=$(printf '%s' "$s" | grep -oiE '(replicas?|instances?|count)[: ]+[0-9]+' | grep -oE '[0-9]+' | head -1)
+  [ -n "$n" ] && { echo "$n"; return; }
+  n=$(printf '%s' "$s" | grep -oiE 'x ?[0-9]+' | grep -oE '[0-9]+' | head -1)
+  [ -n "$n" ] && { echo "$n"; return; }
+  echo 1
+}
+
+extract_image() {
+  local s="$1" k img=""
+  # 1) explicit registry/repo path (contains a slash) — most specific
+  img=$(printf '%s' "$s" | grep -oiE '[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._/-][a-z0-9]+)*(:[a-z0-9._-]+)?' | head -1)
+  [ -n "$img" ] && { echo "$img"; return; }
+  # 2) known images (win over arbitrary bare tokens)
+  for k in nginx redis postgresql postgres mysql mariadb mongodb mongo httpd apache \
+           busybox alpine caddy memcached rabbitmq nodejs node python golang \
+           traefik whoami httpbin grafana prometheus valkey; do
+    if printf '%s' "$s" | grep -qiE "(^|[^a-z0-9])$k([^a-z0-9]|\$)"; then
+      case "$k" in
+        postgresql) echo postgres ;;
+        apache)     echo httpd ;;
+        mongodb)    echo mongo ;;
+        nodejs)     echo node ;;
+        whoami)     echo traefik/whoami ;;
+        httpbin)    echo kennethreitz/httpbin ;;
+        *)          echo "$k" ;;
+      esac
+      return
+    fi
+  done
+  # 3) a bare name:tag token
+  img=$(printf '%s' "$s" | grep -oiE '[a-z0-9]+:[a-z0-9._-]+' | head -1)
+  [ -n "$img" ] && { echo "$img"; return; }
+  echo nginx
+}
+
+extract_name() {
+  local s="$1" img="$2" n="" base
+  n=$(printf '%s' "$s" | grep -oiE '(^|[[:space:]])(called|named|name|as)[[:space:]]+[a-z0-9]([a-z0-9-]*[a-z0-9])?' \
+        | sed -E 's/^[[:space:]]*[A-Za-z]+[[:space:]]+//' | head -1)
+  if [ -n "$n" ]; then printf '%s\n' "$n" | tr '[:upper:]' '[:lower:]'; return; fi
+  base="${img##*/}"; base="${base%%:*}"
+  printf '%s\n' "$base" | tr '[:upper:]' '[:lower:]'
+}
+
+fallback_manifest() {
+  local intent="$1" image name replicas cpu mem
+  image=$(extract_image "$intent")
+  name=$(extract_name "$intent" "$image")
+  replicas=$(extract_replicas "$intent")
+  cpu=100; mem=64
+  case "$image" in
+    *redis*|*postgres*|*mysql*|*mariadb*|*mongo*|*valkey*) cpu=200; mem=256 ;;
+    *grafana*|*prometheus*|*rabbitmq*)                     cpu=200; mem=256 ;;
+  esac
+  jq -nc \
+    --arg name "$name" --arg image "$image" \
+    --argjson replicas "$replicas" --argjson cpu "$cpu" --argjson memory "$mem" \
+    '{deployments:[{name:$name,image:$image,replicas:$replicas,cpu:$cpu,memory:$memory}]}'
+}
+
+# ---- LLM engine -------------------------------------------------------------
+extract_json_span() {
+  # echo the substring from the first { to the last }
+  local s="$1"
+  s="${s#"${s%%\{*}"}"
+  s="${s%"${s##*\}}"}"
+  printf '%s' "$s"
+}
+
+llm_manifest() {
+  local intent="$1" sys body resp text span out
+  command -v curl >/dev/null 2>&1 || { echo "sheetelligence: curl is required for the LLM engine" >&2; return 1; }
+  sys='You convert a natural-language request into a Sheeternetes deployment manifest. '
+  sys+='Respond with ONLY minified JSON, no markdown fences, no prose. '
+  sys+='Schema: {"deployments":[{"name":string,"image":string,"replicas":integer,"cpu":integer_millicores,"memory":integer_MiB}]}. '
+  sys+='Infer a sensible lowercase DNS name, a real container image, replica count, and modest cpu/memory requests.'
+  body=$(jq -nc --arg m "$MODEL" --arg s "$sys" --arg u "$intent" \
+    '{model:$m,max_tokens:1024,system:$s,messages:[{role:"user",content:$u}]}')
+  resp=$(curl -fsS -m 60 https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "$body") || { echo "sheetelligence: Anthropic API call failed" >&2; return 1; }
+  text=$(printf '%s' "$resp" | jq -r '[.content[]? | select(.type=="text") | .text] | add // ""' 2>/dev/null || true)
+  [ -n "$text" ] || { echo "sheetelligence: empty LLM response" >&2; return 1; }
+  span=$(extract_json_span "$text")
+  out=$(printf '%s' "$span" | jq -c '.' 2>/dev/null || true)
+  [ -n "$out" ] || { echo "sheetelligence: LLM did not return valid JSON" >&2; return 1; }
+  printf '%s' "$out"
+}
+
+# ---- normalize --------------------------------------------------------------
+# Accept either {cpu,memory} or {cpu_req,mem_req}; emit both plus command.
+normalize() {
+  jq -c '{deployments: [ .deployments[] | {
+      name,
+      image,
+      replicas: (.replicas // 1),
+      cpu:      (.cpu // .cpu_req // 100),
+      memory:   (.memory // .mem_req // 64),
+      cpu_req:  (.cpu_req // .cpu // 100),
+      mem_req:  (.mem_req // .memory // 64),
+      command:  (.command // "")
+    } ]}'
+}
+
+# ---- apply ------------------------------------------------------------------
+apply_manifest() {
+  local manifest="$1" token payload
+  command -v curl >/dev/null 2>&1 || { echo "sheetelligence: curl is required for --apply" >&2; exit 1; }
+  : "${WEBAPP_URL:?set WEBAPP_URL (env or .skctl.env) to apply}"
+  token="${TOKEN:-CHANGE_ME_super_secret}"
+  payload=$(printf '%s' "$manifest" | jq -c --arg t "$token" \
+    '{token:$t, action:"apply", deployments:.deployments}')
+  curl -fsSL -m 30 -X POST "$WEBAPP_URL" -H 'Content-Type: application/json' -d "$payload" | jq .
+}
+
+# ---- main -------------------------------------------------------------------
+do_apply=0
+intent=""
+for arg in "$@"; do
+  case "$arg" in
+    --apply)      do_apply=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            intent="${intent:+$intent }$arg" ;;
+  esac
+done
+
+[ -n "$intent" ] || { echo "usage: sheetelligence [--apply] \"<plain-English intent>\"" >&2; exit 1; }
+
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  raw=$(llm_manifest "$intent") || raw=$(fallback_manifest "$intent")
+else
+  raw=$(fallback_manifest "$intent")
+fi
+
+manifest=$(printf '%s' "$raw" | normalize)
+
+if [ "$do_apply" -eq 1 ]; then
+  printf '%s\n' "$manifest" | jq .
+  apply_manifest "$manifest"
+else
+  printf '%s\n' "$manifest" | jq .
+fi
