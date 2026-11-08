@@ -17,7 +17,7 @@ Prompt-native, LLM-driven orchestration Part of the spreadsheet-native stack —
 
 ## Usage
 
-`sheetelligence` turns a plain-English intent into a [Sheeternetes](https://github.com/tym83/sheeternetes)
+`sheetelligence` turns a plain-English intent into a [Sheeternetes](https://github.com/sncfoundation/sheeternetes)
 deployment manifest (JSON) and prints it. Pipe it into `skctl apply`, or pass `--apply` to POST it
 straight to the Apps Script apiserver.
 
